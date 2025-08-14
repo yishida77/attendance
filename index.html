@@ -23,7 +23,7 @@
 </head>
 <body>
   <h1>Class Check-In</h1>
-  <div class="muted">Enter your school email, confirm the code, and allow location.</div>
+  <div class="muted">Enter your school email, click the link in your email (or enter the code), then allow location.</div>
 
   <div class="box" id="sessionBox">
     <div id="sessionInfo" class="muted">Loading session…</div>
@@ -32,7 +32,7 @@
   <div class="box" id="authBox">
     <label>Email</label>
     <input id="email" type="email" placeholder="you@school.edu" autocomplete="email"/>
-    <button id="sendCodeBtn">Send 6-digit code</button>
+    <button id="sendCodeBtn">Send login email / code</button>
 
     <div id="codeArea" class="hidden">
       <label>Code</label>
@@ -49,10 +49,12 @@
   </div>
 
   <script>
+  // ---- Supabase client ----
   const SUPABASE_URL = "https://ibxtxcwheknztrcssmhn.supabase.co";
   const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlieHR4Y3doZWtuenRyY3NzbWhuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUxNDEyNzAsImV4cCI6MjA3MDcxNzI3MH0.djGxE9fKFv4GH4QiifWniPdK8w7Gz0AMy0-JOg30QlA";
   const client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+  // ---- Helpers ----
   const $ = (id) => document.getElementById(id);
   const show = (el, yes) => el.classList.toggle('hidden', !yes);
   function msg(id, text, isErr=false, isOk=false){
@@ -75,6 +77,7 @@
   }
   function tail(id) { return id ? id.slice(-8) : ""; }
 
+  // ---- Session loading ----
   const params = new URLSearchParams(window.location.search);
   const sessionId = params.get('session');
   if (!sessionId) {
@@ -106,19 +109,25 @@
     `;
   }
 
-  // Email OTP only
+  // ---- Auth: send magic link (redirects back to this exact URL) and/or OTP code (if your template includes {{ .Token }}) ----
   $('sendCodeBtn').onclick = async () => {
     const email = $('email').value.trim();
     if (!email) return msg('authMsg', 'Enter your email.');
+
     const { error } = await client.auth.signInWithOtp({
       email,
-      options: { shouldCreateUser: true, channel: 'email' }
+      options: {
+        shouldCreateUser: true,
+        emailRedirectTo: window.location.href   // <<-- critical: makes the magic link come back to this page (keeps ?session=...)
+      }
     });
+
     if (error) return msg('authMsg', error.message, true);
-    msg('authMsg', 'Code sent. Check your inbox.');
-    show($('codeArea'), true);
+    msg('authMsg', 'Email sent. Click the link (or enter the 6-digit code if shown).');
+    show($('codeArea'), true); // keep OTP box visible in case your email includes {{ .Token }}
   };
 
+  // ---- Auth: verify 6-digit OTP (fallback if your email template shows {{ .Token }}) ----
   $('verifyBtn').onclick = async () => {
     const email = $('email').value.trim();
     const token = $('otp').value.trim();
@@ -137,6 +146,7 @@
     show($('checkinBox'), true);
   };
 
+  // ---- Geo + check-in ----
   function distanceMeters(lat1, lon1, lat2, lon2) {
     const toRad = d => d * Math.PI / 180;
     const R = 6371000;
@@ -217,7 +227,7 @@
         device_id: deviceId,
         lat, lng,
         accuracy_m: acc,
-        method: 'email_otp'
+        method: 'magic_link_or_otp'
       });
       if (cinErr) return msg('checkMsg', 'Could not save check-in.', true);
 
@@ -231,4 +241,3 @@
   </script>
 </body>
 </html>
-
