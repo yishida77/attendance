@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Class Check‑In</title>
+  <!--
+    Quick setup (read this once):
+    1) Supabase Auth -> enable Email OTP.
+    2) RLS policies applied as we discussed (users/enrollments/checkins: own rows; courses/sessions: select true).
+    3) Create one course + one session (lat,lng,radius, start/end). Copy the session UUID.
+    4) Host this file on https (Netlify/GitHub Pages) or run on http://localhost so geolocation works.
+       Then open: https://.../index.html?session=YOUR_SESSION_UUID
+  -->
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 16px; }
+    .box { border: 1px solid #e5e7eb; border-radius: 12px; padding: 18px; margin: 16px 0; }
+    label { display:block; margin-top:10px; font-weight:600; }
+    input, button { font-size: 16px; padding: 10px; margin-top: 8px; width: 100%; box-sizing: border-box; }
+    button { cursor: pointer; border-radius: 10px; border: 1px solid #e5e7eb; background: #f8fafc; }
+    button:hover { background:#f1f5f9; }
+    .ok { color: #116611; }
+    .err { color: #a40000; }
+    .muted { color: #666; font-size: 14px; }
+    .hidden { display:none; }
+    .pill { display:inline-block; padding: 4px 10px; border-radius: 999px; background:#f1f5f9; margin: 0 6px 6px 0; }
+    code { background: #f6f8fa; padding: 2px 6px; border-radius: 6px; }
+    .small { font-size: 13px; }
+  </style>
+  <!-- Supabase JS (v2) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+</head>
+<body>
+  <h1>Class Check‑In</h1>
+  <div class="muted">Enter your school email, confirm the code, and allow location.</div>
+
+  <div class="box" id="sessionBox">
+    <div id="sessionInfo" class="muted">Loading session…</div>
+  </div>
+
+  <div class="box" id="authBox">
+    <label>Email</label>
+    <input id="email" type="email" placeholder="you@school.edu" autocomplete="email"/>
+    <button id="sendCodeBtn">Send 6‑digit code</button>
+
+    <div id="codeArea" class="hidden">
+      <label>Code</label>
+      <input id="otp" type="text" inputmode="numeric" maxlength="6" placeholder="123456"/>
+      <button id="verifyBtn">Verify & Continue</button>
+    </div>
+    <div id="authMsg" class="muted"></div>
+  </div>
+
+  <div class="box hidden" id="checkinBox">
+    <div><strong>Device</strong>: <code id="deviceIdTail"></code> <span class="small muted">(bound on first successful check‑in)</span></div>
+    <button id="checkBtn">Check in (uses your location)</button>
+    <div id="checkMsg" class="muted"></div>
+  </div>
+
+  <script>
+  // ======= CONFIG: your project (filled in) =======
+  const SUPABASE_URL = "https://ibxtxcwheknztrcssmhn.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlieHR4Y3doZWtuenRyY3NzbWhuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUxNDEyNzAsImV4cCI6MjA3MDcxNzI3MH0.djGxE9fKFv4GH4QiifWniPdK8w7Gz0AMy0-JOg30QlA";
+  // ================================================
+
+  const client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  // Helpers
+  const $ = (id) => document.getElementById(id);
+  const show = (el, yes) => el.classList.toggle('hidden', !yes);
+  function msg(id, text, isErr=false, isOk=false){
+    const el = $(id);
+    el.classList.toggle('err', isErr);
+    el.classList.toggle('ok', isOk);
+    el.textContent = text;
+  }
+  function fmtTime(ts){ try { return new Date(ts).toLocaleString(); } catch { return ts; } }
+
+  // Simple device id (soft bind)
+  function uuidv4() {
+    return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+      (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+    );
+  }
+  function getDeviceId() {
+    let id = localStorage.getItem('device_id');
+    if (!id) { id = uuidv4(); localStorage.setItem('device_id', id); }
+    return id;
+  }
+  function tail(id) { return id ? id.slice(-8) : ""; }
+
+  // Session loading
+  const params = new URLSearchParams(window.location.search);
+  const sessionId = params.get('session');
+  if (!sessionId) {
+    $('sessionInfo').innerHTML = '<span class="err">Missing ?session=UUID in the URL.</span>';
+  }
+
+  let sessionRow = null;
+  let courseId = null;
+
+  async function loadSession() {
+    if (!sessionId) return;
+    const { data, error } = await client
+      .from('sessions')
+      .select('id, course_id, starts_at, ends_at, lat, lng, radius_m, room, courses:course_id(code,title,section)')
+      .eq('id', sessionId)
+      .maybeSingle();
+
+    if (error || !data) {
+      $('sessionInfo').innerHTML = '<span class="err">Could not load session.</span>';
+      return;
+    }
+    sessionRow = data;
+    courseId = data.course_id;
+    $('sessionInfo').innerHTML = `
+      <div><strong>${data.courses?.code || ''} ${data.courses?.section || ''}</strong> – ${data.courses?.title || ''}</div>
+      <div>Room: ${data.room || '—'}</div>
+      <div>Window: ${fmtTime(data.starts_at)} → ${fmtTime(data.ends_at)}</div>
+      <div>Geofence: <span class="pill">${data.radius_m} m</span> around <span class="pill">${Number(data.lat).toFixed(5)}, ${Number(data.lng).toFixed(5)}</span></div>
+    `;
+  }
+
+  // Email OTP flow
+  $('sendCodeBtn').onclick = async () => {
+    const email = $('email').value.trim();
+    if (!email) return msg('authMsg', 'Enter your email.');
+    const { error } = await client.auth.signInWithOtp({ email, options: { shouldCreateUser: true }});
+    if (error) return msg('authMsg', error.message, true);
+    msg('authMsg', 'Code sent. Check your inbox.');
+    show($('codeArea'), true);
+  };
+
+  $('verifyBtn').onclick = async () => {
+    const email = $('email').value.trim();
+    const token = $('otp').value.trim();
+    if (!email || !token) return msg('authMsg', 'Enter the code.');
+    const { error } = await client.auth.verifyOtp({ email, token, type: 'email' });
+    if (error) return msg('authMsg', error.message, true);
+    msg('authMsg', 'Verified.', false, true);
+
+    // Mirror into public.users (so we can FK/own rows)
+    const { data: u } = await client.auth.getUser();
+    if (u?.user) {
+      await client.from('users').upsert({ id: u.user.id, email: u.user.email }, { onConflict: 'id' });
+    }
+
+    show($('authBox'), false);
+    $('deviceIdTail').textContent = '…' + tail(getDeviceId());
+    show($('checkinBox'), true);
+  };
+
+  // Geo helpers
+  function distanceMeters(lat1, lon1, lat2, lon2) {
+    const toRad = d => d * Math.PI / 180;
+    const R = 6371000;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  $('checkBtn').onclick = async () => {
+    if (!sessionRow) return msg('checkMsg', 'Session not loaded.', true);
+
+    // Time window
+    const now = new Date();
+    const starts = new Date(sessionRow.starts_at);
+    const ends = new Date(sessionRow.ends_at);
+    if (now < starts || now > ends) return msg('checkMsg', 'Not within the attendance window.', true);
+
+    // Auth
+    const { data: ures, error: uerr } = await client.auth.getUser();
+    if (uerr || !ures.user) return msg('checkMsg', 'Not signed in.', true);
+    const userId = ures.user.id;
+
+    msg('checkMsg', 'Requesting location…');
+    const geoOpts = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
+
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      const acc = pos.coords.accuracy || 9999;
+      const dist = distanceMeters(lat, lng, sessionRow.lat, sessionRow.lng);
+
+      if (acc > 50) return msg('checkMsg', `Location too imprecise (accuracy ${acc.toFixed(0)} m). Try moving near a window.`, true);
+      if (dist > sessionRow.radius_m) return msg('checkMsg', `You are outside the geofence (${dist.toFixed(0)} m away).`, true);
+
+      const deviceId = getDeviceId();
+
+      // Ensure enrollment exists
+      const { data: enr } = await client
+        .from('enrollments')
+        .select('id, primary_device_id')
+        .eq('user_id', userId)
+        .eq('course_id', courseId)
+        .maybeSingle();
+
+      let primary = enr?.primary_device_id || null;
+      if (!enr) {
+        const { error: ierr } = await client
+          .from('enrollments')
+          .insert({ user_id: userId, course_id: courseId });
+        if (ierr) return msg('checkMsg', 'Cannot create enrollment.', true);
+      }
+
+      // One student per device per session (anti buddy-punch)
+      const { data: priorForDevice, error: priorErr } = await client
+        .from('checkins')
+        .select('user_id')
+        .eq('session_id', sessionId)
+        .eq('device_id', deviceId)
+        .limit(1);
+      if (!priorErr && priorForDevice && priorForDevice.length && priorForDevice[0].user_id !== userId) {
+        return msg('checkMsg', 'This phone already checked in a different student for this session.', true);
+      }
+
+      // Lock or verify device for this course
+      if (!primary) {
+        const { error: upErr } = await client
+          .from('enrollments')
+          .update({ primary_device_id: deviceId })
+          .eq('user_id', userId)
+          .eq('course_id', courseId);
+        if (upErr) return msg('checkMsg', 'Failed to bind device.', true);
+        primary = deviceId;
+      } else {
+        if (primary !== deviceId) {
+          return msg('checkMsg', 'This course is bound to a different phone. See instructor.', true);
+        }
+      }
+
+      // Record check-in
+      const { error: cinErr } = await client.from('checkins').insert({
+        session_id: sessionId,
+        user_id: userId,
+        device_id: deviceId,
+        lat, lng,
+        accuracy_m: acc,
+        method: 'email_otp'
+      });
+      if (cinErr) return msg('checkMsg', 'Could not save check‑in.', true);
+
+      msg('checkMsg', `Checked in at ${now.toLocaleTimeString()} — distance ${dist.toFixed(0)} m — device …${tail(deviceId)}`, false, true);
+    }, () => {
+      msg('checkMsg', 'Location denied or unavailable. Please allow location and try again.', true);
+    }, geoOpts);
+  };
+
+  // Start
+  loadSession();
+  </script>
+</body>
+</html>
