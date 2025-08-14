@@ -212,11 +212,20 @@
       const acc = pos.coords.accuracy || 9999;
       const dist = distanceMeters(lat, lng, sessionRow.lat, sessionRow.lng);
 
-      if (acc > 50) return msg('checkMsg', `Location too imprecise (accuracy ${acc.toFixed(0)} m). Try moving near a window.`, true);
-      if (dist > sessionRow.radius_m) return msg('checkMsg', `You are outside the geofence (${dist.toFixed(0)} m away).`, true);
+      // --- NEW: warn but do not block ---
+      let warn = '';
+      if (acc > 50) warn = ` (low GPS accuracy ~${acc.toFixed(0)} m)`;
+      const inside = dist <= sessionRow.radius_m;
+
+      if (!inside) {
+        msg('checkMsg', `Outside geofence (${dist.toFixed(0)} m away)${warn}. Recording anyway…`);
+      } else {
+        msg('checkMsg', `Inside geofence (${dist.toFixed(0)} m). Recording…${warn}`);
+      }
 
       const deviceId = getDeviceId();
 
+      // Ensure enrollment exists
       const { data: enr } = await client
         .from('enrollments')
         .select('id, primary_device_id')
@@ -232,6 +241,7 @@
         if (ierr) return msg('checkMsg', 'Cannot create enrollment.', true);
       }
 
+      // One student per device per session
       const { data: priorForDevice, error: priorErr } = await client
         .from('checkins')
         .select('user_id')
@@ -242,6 +252,7 @@
         return msg('checkMsg', 'This phone already checked in a different student for this session.', true);
       }
 
+      // Bind device on first check-in for this course
       if (!primary) {
         const { error: upErr } = await client
           .from('enrollments')
@@ -250,18 +261,19 @@
           .eq('course_id', courseId);
         if (upErr) return msg('checkMsg', 'Failed to bind device.', true);
         primary = deviceId;
-      } else {
-        if (primary !== deviceId) {
-          return msg('checkMsg', 'This course is bound to a different phone. See instructor.', true);
-        }
+      } else if (primary !== deviceId) {
+        return msg('checkMsg', 'This course is bound to a different phone. See instructor.', true);
       }
 
+      // Insert the check-in with tags
       const { error: cinErr } = await client.from('checkins').insert({
         session_id: sessionId,
         user_id: userId,
         device_id: deviceId,
         lat, lng,
         accuracy_m: acc,
+        distance_m: dist,
+        inside_geofence: inside,
         method: 'magic_link_or_otp'
       });
       if (cinErr) return msg('checkMsg', 'Could not save check-in.', true);
