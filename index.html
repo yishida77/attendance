@@ -48,6 +48,8 @@
     <div id="checkMsg" class="muted"></div>
   </div>
 
+  <div class="muted small" id="authState">Auth: checking…</div>
+
   <script>
   // ---- Supabase client ----
   const SUPABASE_URL = "https://ibxtxcwheknztrcssmhn.supabase.co";
@@ -64,6 +66,7 @@
     el.textContent = text;
   }
   function fmtTime(ts){ try { return new Date(ts).toLocaleString(); } catch { return ts; } }
+  function setAuthState(text){ $('authState').textContent = 'Auth: ' + text; }
 
   function uuidv4() {
     return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
@@ -115,19 +118,20 @@
     if (!email) return msg('authMsg', 'Enter your email.');
     if (!sessionId) return msg('authMsg', 'This link is missing ?session=... Ask your instructor for the correct link.', true);
 
-    const redirect = window.location.origin + window.location.pathname + '?session=' + encodeURIComponent(sessionId);
+    // Use the exact current URL (keeps ?session=... intact)
+    const redirect = window.location.origin + window.location.pathname + window.location.search;
 
     const { error } = await client.auth.signInWithOtp({
       email,
       options: {
         shouldCreateUser: true,
-        emailRedirectTo: redirect    // return to SAME session link after clicking email
+        emailRedirectTo: redirect
       }
     });
 
     if (error) return msg('authMsg', error.message, true);
-    msg('authMsg', 'Email sent. Click the link (or enter the 6-digit code if shown).');
-    show($('codeArea'), true); // keep OTP box visible if your template shows {{ .Token }}
+    msg('authMsg', 'Email sent. Click the link (or enter the 6‑digit code if shown).');
+    show($('codeArea'), true);
   };
 
   // ---- Auth: verify 6-digit OTP (fallback if your email template shows {{ .Token }}) ----
@@ -143,14 +147,18 @@
 
   // ---- Handle magic-link return: exchange code for a session, then clean URL ----
   async function handleMagicLinkReturn() {
-    // This parses the current URL (query or hash) and exchanges any one-time code.
-    const { data, error } = await client.auth.exchangeCodeForSession(window.location.href);
-    // If a session was created, strip code params from the URL but keep ?session=...
-    const hasSession = data && (data.session || data.user);
-    if (!error && hasSession) {
-      const clean = window.location.origin + window.location.pathname +
-                    (sessionId ? ('?session=' + encodeURIComponent(sessionId)) : '');
-      window.history.replaceState({}, '', clean);
+    try {
+      const { data, error } = await client.auth.exchangeCodeForSession(window.location.href);
+      const hasSession = data && (data.session || data.user);
+      if (error) console.warn('exchange error:', error);
+      if (hasSession) {
+        // keep only ?session=...; drop one-time auth params
+        const clean = window.location.origin + window.location.pathname +
+                      (sessionId ? ('?session=' + encodeURIComponent(sessionId)) : '');
+        window.history.replaceState({}, '', clean);
+      }
+    } catch (e) {
+      console.warn('exchange threw:', e);
     }
   }
 
@@ -158,14 +166,17 @@
   async function onSignedIn() {
     const { data: u } = await client.auth.getUser();
     if (u?.user) {
+      setAuthState('signed in as ' + (u.user.email || u.user.id));
       await client.from('users').upsert({ id: u.user.id, email: u.user.email }, { onConflict: 'id' });
       show($('authBox'), false);
       $('deviceIdTail').textContent = '…' + tail(getDeviceId());
       show($('checkinBox'), true);
+    } else {
+      setAuthState('not signed in');
     }
   }
 
-  // Also react to auth state changes triggered by the exchange above
+  // React to auth state changes
   client.auth.onAuthStateChange((_event, session) => {
     if (session) onSignedIn();
   });
@@ -265,7 +276,9 @@
   (async () => {
     await handleMagicLinkReturn();
     await loadSession();
-    await onSignedIn(); // in case you were already signed in (or the exchange just succeeded)
+    const { data: sessionNow } = await client.auth.getSession();
+    setAuthState(sessionNow?.session ? 'signed in' : 'not signed in');
+    await onSignedIn();
   })();
   </script>
 </body>
