@@ -23,7 +23,7 @@
 </head>
 <body>
   <h1>Class Check-In</h1>
-  <div class="muted">Enter your school email, click the link in your email (or enter the code), then allow location.</div>
+  <div class="muted">Enter your email, click the link (or enter the code), then allow location.</div>
 
   <div class="box" id="sessionBox">
     <div id="sessionInfo" class="muted">Loading session…</div>
@@ -109,22 +109,25 @@
     `;
   }
 
-  // ---- Auth: send magic link (redirects back to this exact URL) and/or OTP code (if your template includes {{ .Token }}) ----
+  // ---- Auth: send magic link (redirects back to this exact URL) and/or OTP (if template includes {{ .Token }}) ----
   $('sendCodeBtn').onclick = async () => {
     const email = $('email').value.trim();
     if (!email) return msg('authMsg', 'Enter your email.');
+    if (!sessionId) return msg('authMsg', 'This link is missing ?session=... Ask your instructor for the correct link.', true);
+
+    const redirect = window.location.origin + window.location.pathname + '?session=' + encodeURIComponent(sessionId);
 
     const { error } = await client.auth.signInWithOtp({
       email,
       options: {
         shouldCreateUser: true,
-        emailRedirectTo: window.location.href   // <<-- critical: makes the magic link come back to this page (keeps ?session=...)
+        emailRedirectTo: redirect    // return to SAME session link after clicking email
       }
     });
 
     if (error) return msg('authMsg', error.message, true);
     msg('authMsg', 'Email sent. Click the link (or enter the 6-digit code if shown).');
-    show($('codeArea'), true); // keep OTP box visible in case your email includes {{ .Token }}
+    show($('codeArea'), true); // keep OTP box visible if your template shows {{ .Token }}
   };
 
   // ---- Auth: verify 6-digit OTP (fallback if your email template shows {{ .Token }}) ----
@@ -135,16 +138,37 @@
     const { error } = await client.auth.verifyOtp({ email, token, type: 'email' });
     if (error) return msg('authMsg', error.message, true);
     msg('authMsg', 'Verified.', false, true);
+    await onSignedIn();
+  };
 
+  // ---- Handle magic-link return: exchange code for a session, then clean URL ----
+  async function handleMagicLinkReturn() {
+    // This parses the current URL (query or hash) and exchanges any one-time code.
+    const { data, error } = await client.auth.exchangeCodeForSession(window.location.href);
+    // If a session was created, strip code params from the URL but keep ?session=...
+    const hasSession = data && (data.session || data.user);
+    if (!error && hasSession) {
+      const clean = window.location.origin + window.location.pathname +
+                    (sessionId ? ('?session=' + encodeURIComponent(sessionId)) : '');
+      window.history.replaceState({}, '', clean);
+    }
+  }
+
+  // ---- When signed in, flip the UI ----
+  async function onSignedIn() {
     const { data: u } = await client.auth.getUser();
     if (u?.user) {
       await client.from('users').upsert({ id: u.user.id, email: u.user.email }, { onConflict: 'id' });
+      show($('authBox'), false);
+      $('deviceIdTail').textContent = '…' + tail(getDeviceId());
+      show($('checkinBox'), true);
     }
+  }
 
-    show($('authBox'), false);
-    $('deviceIdTail').textContent = '…' + tail(getDeviceId());
-    show($('checkinBox'), true);
-  };
+  // Also react to auth state changes triggered by the exchange above
+  client.auth.onAuthStateChange((_event, session) => {
+    if (session) onSignedIn();
+  });
 
   // ---- Geo + check-in ----
   function distanceMeters(lat1, lon1, lat2, lon2) {
@@ -237,7 +261,12 @@
     }, geoOpts);
   };
 
-  loadSession();
+  // ---- Init: exchange code (if returning from email), then load session and flip UI if already signed in ----
+  (async () => {
+    await handleMagicLinkReturn();
+    await loadSession();
+    await onSignedIn(); // in case you were already signed in (or the exchange just succeeded)
+  })();
   </script>
 </body>
 </html>
